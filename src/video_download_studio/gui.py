@@ -12,7 +12,7 @@ from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QLocale, Qt, QThread, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QIcon
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -53,6 +53,10 @@ I18N: dict[str, dict[str, str]] = {
         "stop": "停止",
         "queue": "任务队列",
         "log": "运行日志",
+        "preview": "下载预览",
+        "preview_idle": "等待预览帧...",
+        "preview_unavailable": "预览不可用",
+        "preview_source": "预览源: {name}",
         "batch_title": "批量添加 URL",
         "batch_hint": "每行一个 URL",
         "confirm_add": "确认添加",
@@ -107,6 +111,10 @@ I18N: dict[str, dict[str, str]] = {
         "stop": "Stop",
         "queue": "Task Queue",
         "log": "Runtime Log",
+        "preview": "Preview",
+        "preview_idle": "Waiting for preview frame...",
+        "preview_unavailable": "Preview unavailable",
+        "preview_source": "Preview Source: {name}",
         "batch_title": "Batch Add URLs",
         "batch_hint": "One URL per line",
         "confirm_add": "Confirm",
@@ -316,6 +324,8 @@ class JobWorker(QObject):
     log = Signal(str)
     status_changed = Signal(int, str)
     row_metrics = Signal(int, str, str)
+    preview_frame = Signal(bytes, str)
+    preview_state = Signal(str)
     finished = Signal(int, int, bool)
 
     def __init__(self, items: list[QueueItem], output_dir: str, lang: str):
@@ -326,12 +336,16 @@ class JobWorker(QObject):
         self.stop_event = threading.Event()
         self.current_process: subprocess.Popen | None = None
         self.client: VideoClient | None = None
+        self._preview_thread: threading.Thread | None = None
+        self._preview_stop_event = threading.Event()
+        self._preview_process: subprocess.Popen | None = None
 
     def _tr(self, zh: str, en: str) -> str:
         return zh if self.lang == "zh" else en
 
     def request_stop(self) -> None:
         self.stop_event.set()
+        self._preview_stop_event.set()
 
         if self.client is not None:
             self.client.request_stop()
@@ -342,6 +356,10 @@ class JobWorker(QObject):
                 process.terminate()
             except Exception:
                 pass
+
+        preview_process = self._preview_process
+        if preview_process is not None and preview_process.poll() is None:
+            VideoClient._terminate_process(preview_process, timeout=1.0)
 
     def run(self) -> None:
         client = VideoClient(output_dir=self.output_dir, stop_event=self.stop_event)
@@ -393,34 +411,183 @@ class JobWorker(QObject):
                     )
                 )
 
-                if mode == "live":
-                    rc = self._run_live_job(client, item.job, detection, item.row)
-                else:
-                    rc = client.download_vod(item.job.url, detection)
+                preview_url = self._resolve_preview_source(client, detection, item.job, mode)
+                self._start_preview(client, preview_url, detection.title or item.job.url)
 
-                if rc == 0:
-                    success += 1
-                    self.row_metrics.emit(item.row, "100%", "-")
-                    self.status_changed.emit(item.row, "done")
-                    self.log.emit(self._tr(f"完成: {item.job.url}", f"Done: {item.job.url}"))
-                elif self.stop_event.is_set() or rc == 130:
-                    stopped = True
-                    self.status_changed.emit(item.row, "stopped")
-                    self.log.emit(self._tr(f"已停止: {item.job.url}", f"Stopped: {item.job.url}"))
-                    break
-                else:
-                    failed += 1
-                    self.status_changed.emit(item.row, f"failed({rc})")
-                    self.log.emit(self._tr(f"失败: {item.job.url} (code={rc})", f"Failed: {item.job.url} (code={rc})"))
-                    if client.last_error:
-                        self.log.emit(self._tr(f"原因: {client.last_error}", f"Reason: {client.last_error}"))
+                try:
+                    if mode == "live":
+                        rc = self._run_live_job(client, item.job, detection, item.row)
+                    else:
+                        rc = client.download_vod(item.job.url, detection)
+
+                    if rc == 0:
+                        success += 1
+                        self.row_metrics.emit(item.row, "100%", "-")
+                        self.status_changed.emit(item.row, "done")
+                        self.log.emit(self._tr(f"完成: {item.job.url}", f"Done: {item.job.url}"))
+                    elif self.stop_event.is_set() or rc == 130:
+                        stopped = True
+                        self.status_changed.emit(item.row, "stopped")
+                        self.log.emit(self._tr(f"已停止: {item.job.url}", f"Stopped: {item.job.url}"))
+                        break
+                    else:
+                        failed += 1
+                        self.status_changed.emit(item.row, f"failed({rc})")
+                        self.log.emit(self._tr(f"失败: {item.job.url} (code={rc})", f"Failed: {item.job.url} (code={rc})"))
+                        if client.last_error:
+                            self.log.emit(self._tr(f"原因: {client.last_error}", f"Reason: {client.last_error}"))
+                finally:
+                    self._stop_preview()
+                    self.preview_state.emit(tr(self.lang, "preview_idle"))
         except Exception as exc:
             failed += 1
             self.log.emit(self._tr(f"执行异常: {exc}", f"Runtime exception: {exc}"))
         finally:
+            self._stop_preview()
+            self.preview_state.emit(tr(self.lang, "preview_idle"))
             self.client = None
             self.finished.emit(success, failed, stopped)
 
+    def _resolve_preview_source(self, client: VideoClient, detection: DetectionResult, job: DownloadJob, mode: str) -> str:
+        if mode == "live":
+            if detection.stream_url:
+                return detection.stream_url
+            if detection.raw_info:
+                live_url = client._pick_stream_url(detection.raw_info, prefer_live=True)
+                if live_url:
+                    return live_url
+            return job.url
+
+        if detection.raw_info:
+            vod_url = client._pick_stream_url(detection.raw_info, prefer_live=False)
+            if vod_url:
+                return vod_url
+
+        if detection.direct_video_urls:
+            return detection.direct_video_urls[0]
+
+        return job.url
+
+    def _start_preview(self, client: VideoClient, source_url: str, title: str) -> None:
+        self._stop_preview()
+
+        if not source_url:
+            self.preview_state.emit(tr(self.lang, "preview_unavailable"))
+            return
+
+        if not client._ffmpeg_exists():
+            self.preview_state.emit(tr(self.lang, "preview_unavailable"))
+            return
+
+        self._preview_stop_event.clear()
+        display_title = title if len(title) <= 52 else title[:49] + "..."
+        display_title = f"{display_title} (25 FPS)"
+        self.preview_state.emit(tr(self.lang, "preview_source", name=display_title))
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop,
+            args=(client.ffmpeg_bin, source_url),
+            daemon=True,
+        )
+        self._preview_thread.start()
+
+    def _stop_preview(self) -> None:
+        self._preview_stop_event.set()
+
+        preview_process = self._preview_process
+        if preview_process is not None and preview_process.poll() is None:
+            VideoClient._terminate_process(preview_process, timeout=1.0)
+
+        if self._preview_thread and self._preview_thread.is_alive():
+            self._preview_thread.join(timeout=1.5)
+
+        self._preview_thread = None
+        self._preview_process = None
+
+    def _preview_loop(self, ffmpeg_bin: str, source_url: str) -> None:
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source_url,
+            "-an",
+            "-vf",
+            "fps=25,scale=640:-2",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-q:v",
+            "8",
+            "pipe:1",
+        ]
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                bufsize=0,
+                **VideoClient._popen_kwargs_no_window(),
+            )
+        except Exception:
+            self.preview_state.emit(tr(self.lang, "preview_unavailable"))
+            return
+
+        self._preview_process = process
+        stream = process.stdout
+        if stream is None:
+            self.preview_state.emit(tr(self.lang, "preview_unavailable"))
+            self._preview_process = None
+            return
+
+        buffer = bytearray()
+        no_frame_since = time.monotonic()
+        warned_unavailable = False
+
+        try:
+            while not self._preview_stop_event.is_set() and not self.stop_event.is_set():
+                chunk = stream.read(32 * 1024)
+                if not chunk:
+                    if process.poll() is not None:
+                        break
+                    if (time.monotonic() - no_frame_since) >= 3.0 and not warned_unavailable:
+                        warned_unavailable = True
+                        self.preview_state.emit(tr(self.lang, "preview_unavailable"))
+                    continue
+
+                buffer.extend(chunk)
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start < 0:
+                        if len(buffer) > 1024 * 1024:
+                            del buffer[:-2]
+                        break
+
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start > 0:
+                            del buffer[:start]
+                        break
+
+                    frame = bytes(buffer[start : end + 2])
+                    del buffer[: end + 2]
+
+                    self.preview_frame.emit(frame, source_url)
+                    no_frame_since = time.monotonic()
+                    warned_unavailable = False
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+            if process.poll() is None:
+                VideoClient._terminate_process(process, timeout=1.0)
+
+            self._preview_process = None
     def _run_live_job(self, client: VideoClient, job: DownloadJob, detection: DetectionResult, row: int) -> int:
         stream_url = detection.stream_url
         if not stream_url and detection.raw_info:
@@ -561,6 +728,9 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 7)
         self.log_box = QTextEdit()
+        self.preview_label = QLabel(tr(self.lang, "preview_idle"))
+        self.preview_meta = QLabel("-")
+        self._preview_pixmap: QPixmap | None = None
         self.status_label = QLabel(tr(self.lang, "idle"))
         self.progress = QProgressBar()
 
@@ -688,6 +858,16 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel(tr(self.lang, "queue")))
         right_layout.addWidget(self.table, 1)
 
+        self.preview_label.setObjectName("PreviewFrame")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(210)
+        self.preview_meta.setObjectName("PreviewMeta")
+        self.preview_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        right_layout.addWidget(QLabel(tr(self.lang, "preview")))
+        right_layout.addWidget(self.preview_label)
+        right_layout.addWidget(self.preview_meta)
+
         self.log_box.setReadOnly(True)
         right_layout.addWidget(QLabel(tr(self.lang, "log")))
         right_layout.addWidget(self.log_box, 1)
@@ -748,6 +928,18 @@ class MainWindow(QMainWindow):
             QTextEdit {
                 font-family: 'Consolas';
                 font-size: 12px;
+            }
+            QLabel#PreviewFrame {
+                background-color: #071225;
+                border: 1px solid #2a3e66;
+                border-radius: 10px;
+                color: #93c5fd;
+                font-size: 12px;
+            }
+            QLabel#PreviewMeta {
+                color: #93c5fd;
+                font-size: 12px;
+                padding: 2px;
             }
             QPushButton {
                 background-color: #1e293b;
@@ -901,6 +1093,8 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._log)
         self.worker.status_changed.connect(self._set_row_status)
         self.worker.row_metrics.connect(self._set_row_metrics)
+        self.worker.preview_frame.connect(self._on_preview_frame)
+        self.worker.preview_state.connect(self._on_preview_state)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.worker.deleteLater)
@@ -910,6 +1104,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.status_label.setText(tr(self.lang, "running"))
         self.progress.setRange(0, 0)
+        self._on_preview_state(tr(self.lang, "preview_idle"))
         self._log(f"Started tasks, total: {len(items)}" if self.lang == "en" else f"开始执行任务，总数: {len(items)}")
         self.worker_thread.start()
 
@@ -955,6 +1150,34 @@ class MainWindow(QMainWindow):
         if b_item is not None:
             b_item.setText(bitrate)
             b_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def _on_preview_frame(self, frame_bytes: bytes, source_url: str) -> None:
+        pixmap = QPixmap()
+        if not frame_bytes or not pixmap.loadFromData(frame_bytes):
+            return
+
+        self._preview_pixmap = pixmap
+        scaled = pixmap.scaled(
+            self.preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
+        self.preview_label.setText("")
+        if source_url:
+            display = source_url if len(source_url) <= 88 else source_url[:85] + "..."
+            self.preview_meta.setText(tr(self.lang, "preview_source", name=display))
+
+    def _on_preview_state(self, state: str) -> None:
+        reset_states = {tr(self.lang, "preview_idle"), tr(self.lang, "preview_unavailable")}
+        if state in reset_states:
+            self._preview_pixmap = None
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText(state)
+        elif self._preview_pixmap is None:
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText(state)
+        self.preview_meta.setText(state)
 
     def _on_worker_finished(self, success: int, failed: int, stopped: bool) -> None:
         self.run_btn.setEnabled(True)
@@ -1026,6 +1249,17 @@ class MainWindow(QMainWindow):
             return int(raw)
         return None
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self._preview_pixmap is None or self._preview_pixmap.isNull():
+            return
+
+        scaled = self._preview_pixmap.scaled(
+            self.preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(scaled)
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker_thread and self.worker_thread.isRunning():
             result = QMessageBox.question(self, tr(self.lang, "exit"), tr(self.lang, "exit_confirm"))
@@ -1051,6 +1285,38 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
